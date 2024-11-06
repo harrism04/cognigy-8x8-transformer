@@ -71,27 +71,56 @@ interface I8x8TemplateMessage extends I8x8MessageBase {
 
 interface I8x8InteractiveMessage extends I8x8MessageBase {
     contentType: 'interactive';
-    interactive: {
-        type: 'button';  // Required
-        header?: {       // Optional
-            type: 'text';
-            text: string;
-        };
-        body: {          // Required
-            text: string;
-        };
-        footer?: {       // Optional
-            text: string;
-        };
-        action: {        // Required
-            buttons: Array<{
-                type: 'reply';
-                reply: {
-                    id: string;
-                    title: string;
-                }
-            }>
-        };
+    interactive: I8x8ButtonInteractive | I8x8ListInteractive;
+}
+
+// New interface for Button type interactive messages
+interface I8x8ButtonInteractive {
+    type: 'button';
+    header?: {
+        type: 'text';
+        text: string;
+    };
+    body: {
+        text: string;
+    };
+    footer?: {
+        text: string;
+    };
+    action: {
+        buttons: Array<{
+            type: 'reply';
+            reply: {
+                id: string;
+                title: string;
+            }
+        }>;
+    };
+}
+
+// New interface for List type interactive messages
+interface I8x8ListInteractive {
+    type: 'list';
+    header?: {
+        type: 'text';
+        text: string;
+    };
+    body: {
+        text: string;
+    };
+    footer?: {
+        text: string;
+    };
+    action: {
+        button: string;
+        sections: Array<{
+            title: string;
+            rows: Array<{
+                id: string;
+                title: string;
+                description?: string;
+            }>;
+        }>;
     };
 }
 
@@ -133,6 +162,39 @@ function convertQuickRepliesTo8x8Interactive(data: any, sessionId: string): I8x8
     console.log("Converting quick replies to interactive message:");
     console.log(JSON.stringify(data, null, 2));
 
+    // Check if this should be a list message
+    if (data.displayType === 'list') {
+        return {
+            from: sessionId,
+            contentType: "interactive",
+            interactive: {
+                type: "list",
+                header: data.header ? {
+                    type: "text",
+                    text: data.header
+                } : undefined,
+                body: {
+                    text: data.text || "Please select an option"
+                },
+                footer: data.footer ? {
+                    text: data.footer
+                } : undefined,
+                action: {
+                    button: data.buttonText || "Select Option",
+                    sections: data.sections || [{
+                        title: "Options",
+                        rows: (data.quickReplies || []).map((qr: any, index: number) => ({
+                            id: `option-${index + 1}`,
+                            title: qr.title,
+                            description: qr.description
+                        }))
+                    }]
+                }
+            }
+        };
+    }
+
+    // Default to button type for backward compatibility
     return {
         from: sessionId,
         contentType: "interactive",
@@ -270,48 +332,50 @@ createWebhookTransformer({
                 console.log("Found quick replies data:");
                 console.log(JSON.stringify(output.data.quickReplies, null, 2));
 
-                // Ensure required fields are present
-                if (!output.data.quickReplies.text || !output.data.quickReplies.quickReplies?.length) {
+                // Remove the nested check since quickReplies data is already at this level
+                if (!output.data.quickReplies.text || !output.data.quickReplies.quickReplies) {
                     console.error("Missing required fields for quick replies");
                     return null;
                 }
 
-                return await sendSingleMessage(clearUserId, {
+                return await sendSingleMessage(clearUserId, convertQuickRepliesTo8x8Interactive(output.data.quickReplies, clearSessionId));
+
+            } else if (output.data?.list) {
+                console.log("Found list data:");
+                console.log(JSON.stringify(output.data.list, null, 2));
+
+                // Ensure required fields are present
+                if (!output.data.list.text || !output.data.list.sections?.length) {
+                    console.error("Missing required fields for list message");
+                    return null;
+                }
+
+                const listMessage: I8x8InteractiveMessage = {
                     from: clearSessionId,
-                    contentType: "interactive",
+                    contentType: "interactive" as const,
                     interactive: {
-                        type: "button",
-                        // Optional header
-                        ...(output.data.quickReplies.header && {
-                            header: {
-                                type: "text",
-                                text: output.data.quickReplies.header
-                            }
-                        }),
-                        // Required body
+                        type: "list" as const,
+                        header: output.data.list.header ? {
+                            type: "text" as const,
+                            text: output.data.list.header
+                        } : undefined,
                         body: {
-                            text: output.data.quickReplies.text
+                            text: output.data.list.text
                         },
-                        // Optional footer
-                        ...(output.data.quickReplies.footer && {
-                            footer: {
-                                text: output.data.quickReplies.footer
-                            }
-                        }),
-                        // Required action with buttons
+                        footer: output.data.list.footer ? {
+                            text: output.data.list.footer
+                        } : undefined,
                         action: {
-                            buttons: output.data.quickReplies.quickReplies
-                                .slice(0, 3)
-                                .map((qr: any, index: number) => ({
-                                    type: "reply",
-                                    reply: {
-                                        id: `option-${index + 1}`,
-                                        title: qr.title
-                                    }
-                                }))
+                            button: output.data.list.buttonText || "View Options",
+                            sections: output.data.list.sections
                         }
                     }
-                });
+                };
+
+                console.log("Constructed list message:");
+                console.log(JSON.stringify(listMessage, null, 2));
+
+                return await sendSingleMessage(clearUserId, listMessage);
             } else if (output.text) {
                 console.log("Output has text property");
                 return await sendSingleMessage(clearUserId, {
@@ -375,10 +439,21 @@ async function sendSingleMessage(to: string, message: T8x8Content) {
             requestBody.content = (message as I8x8VideoMessage).video;
             break;
         case 'interactive':
+            const interactiveMessage = message as I8x8InteractiveMessage;
             requestBody.content = {
                 interactive: {
-                    type: "button",
-                    ...(message as I8x8InteractiveMessage).interactive
+                    type: interactiveMessage.interactive.type,
+                    header: interactiveMessage.interactive.header,
+                    body: interactiveMessage.interactive.body,
+                    footer: interactiveMessage.interactive.footer,
+                    action: interactiveMessage.interactive.type === 'list' 
+                        ? {
+                            button: (interactiveMessage.interactive as I8x8ListInteractive).action.button,
+                            sections: (interactiveMessage.interactive as I8x8ListInteractive).action.sections
+                        }
+                        : {
+                            buttons: (interactiveMessage.interactive as I8x8ButtonInteractive).action.buttons
+                        }
                 }
             };
             break;
